@@ -92,9 +92,16 @@ func main() {
 		fmt.Printf("Tabla %d: %s\n", i+1, table)
 	}
 
-	if err := db.MigrateData(dbRivadavia.DB, dbDatalitica.DB, tablesRivadavia); err != nil {
-		fmt.Printf("Error en la migración: %v\n", err)
+	// if err := db.MigrateData(dbRivadavia.DB, dbDatalitica.DB, tablesRivadavia); err != nil {
+	// 	fmt.Printf("Error en la migración: %v\n", err)
+	// 	return
+	// }
+	if err := dbRivadavia.CopyDatabaseToPostgres(dbDatalitica); err != nil {
+		fmt.Printf("Error en la copia de la base de datos: %v\n", err)
 		return
 	}
 
+	// Cerrar conexiones al finalizar
+	defer dbRivadavia.CloseConnection()
+	defer dbDatalitica.CloseConnection()
 }
