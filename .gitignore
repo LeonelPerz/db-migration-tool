@@ -1,3 +1,33 @@
 /.env
 *.ipynb
+# Binarios compilados
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Archivos de prueba
+*.test
+
+# Archivos de cobertura
+*.out
+
+# Archivos de dependencias
+/vendor/
+
+# Archivos temporales de Go
+*.o
+*.a
+
+# Archivos de texto
 *.txt
+
+# Archivos de IDE y editores
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Archivos de debug
+debug
