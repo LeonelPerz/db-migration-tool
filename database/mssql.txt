@@ -1,0 +1,540 @@
+package database
+
+import (
+	"database/sql"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	_ "github.com/denisenkom/go-mssqldb" // Driver para Microsoft SQL Server
+)
+
+type MSSQL struct {
+	DB       *sql.DB
+	user     string
+	password string
+	database string
+	host     string
+	port     int
+}
+
+// NewMSSQL crea una nueva instancia de MSSQL
+func NewMSSQL(user, password, database, host string, port int) *MSSQL {
+	return &MSSQL{
+		user:     user,
+		password: password,
+		database: database,
+		host:     host,
+		port:     port,
+	}
+}
+
+// getConnection establece una conexión a la base de datos
+func (m *MSSQL) GetConnection() error {
+	if m.DB != nil {
+		return nil // Ya existe una conexión
+	}
+
+	// dsn := fmt.Sprintf("sqlserver://%s:%s@%s:%d?database=%s)",
+	dsn := fmt.Sprintf("sqlserver://%s:%s@%s:%d?database=%s&encrypt=disable&trustServerCertificate=true",
+		m.user, m.password, m.host, m.port, m.database)
+
+	DB, err := sql.Open("sqlserver", dsn)
+	if err != nil {
+		return fmt.Errorf("error al abrir la conexión: %w", err)
+	}
+
+	// Verificar la conexión
+	if err := DB.Ping(); err != nil {
+		return fmt.Errorf("error al verificar la conexión: %w", err)
+	}
+
+	m.DB = DB
+	return nil
+}
+
+// getTables obtiene todas las tablas de la base de datos
+func (m *MSSQL) GetTables() ([]string, error) {
+	if m.DB == nil {
+		return nil, fmt.Errorf("no hay una conexión activa")
+	}
+
+	query := `SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'`
+	rows, err := m.DB.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("error al obtener las tablas: %w", err)
+	}
+	defer rows.Close()
+
+	var tables []string
+	for rows.Next() {
+		var tableName string
+		if err := rows.Scan(&tableName); err != nil {
+			return nil, fmt.Errorf("error al escanear el resultado: %w", err)
+		}
+		tables = append(tables, tableName)
+	}
+
+	return tables, nil
+}
+
+// closeConnection cierra la conexión a la base de datos
+func (m *MSSQL) CloseConnection() error {
+	if m.DB == nil {
+		return nil // Ya está cerrada
+	}
+
+	if err := m.DB.Close(); err != nil {
+		return fmt.Errorf("error al cerrar la conexión: %w", err)
+	}
+
+	m.DB = nil
+	return nil
+}
+
+func (m *MSSQL) CopyDatabaseToPostgres(targetDB *Postgres) error {
+	startTime := time.Now()
+	tables, err := m.GetTables()
+	if err != nil {
+		return fmt.Errorf("error al obtener las tablas: %w", err)
+	}
+
+	fmt.Printf("\nIniciando migración de %d tablas\n", len(tables))
+
+	// Verificar conexiones
+	if m.DB == nil {
+		return fmt.Errorf("no hay una conexión activa en la base de datos origen")
+	}
+	if targetDB.DB == nil {
+		return fmt.Errorf("no hay una conexión activa en la base de datos destino")
+	}
+
+	// Iniciar transacción en la base de datos destino
+	tx, err := targetDB.DB.Begin()
+	if err != nil {
+		return fmt.Errorf("error al iniciar la transacción: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+
+	// Procesar cada tabla
+	for _, tableName := range tables {
+		// Obtener estructura de la tabla
+		// Obtener estructura de la tabla con longitud de campos
+		columnsQuery := `
+			SELECT 
+				COLUMN_NAME,
+				DATA_TYPE + 
+				CASE 
+					WHEN CHARACTER_MAXIMUM_LENGTH IS NOT NULL 
+						THEN '(' + CAST(CHARACTER_MAXIMUM_LENGTH AS VARCHAR) + ')'
+					WHEN NUMERIC_PRECISION IS NOT NULL AND NUMERIC_SCALE IS NOT NULL
+						THEN '(' + CAST(NUMERIC_PRECISION AS VARCHAR) + ',' + CAST(NUMERIC_SCALE AS VARCHAR) + ')'
+					ELSE ''
+				END as DATA_TYPE
+			FROM INFORMATION_SCHEMA.COLUMNS 
+			WHERE TABLE_NAME = @p1 
+			ORDER BY ORDINAL_POSITION`
+
+		rows, err := m.DB.Query(columnsQuery, tableName)
+		if err != nil {
+			return fmt.Errorf("error al obtener la estructura de la tabla %s: %w", tableName, err)
+		}
+		defer rows.Close()
+
+		var columns []string
+		var dataTypes []string
+		for rows.Next() {
+			var colName, dataType string
+			if err := rows.Scan(&colName, &dataType); err != nil {
+				return fmt.Errorf("error al escanear columna: %w", err)
+			}
+			columns = append(columns, colName)
+			dataTypes = append(dataTypes, m.convertDataType(dataType))
+		}
+
+		// En CopyDatabaseToPostgres
+		safeTableName := strings.ReplaceAll(tableName, "-", "_")
+		dropQuery := fmt.Sprintf(`DROP TABLE IF EXISTS "%s" CASCADE`, safeTableName)
+		if _, err := tx.Exec(dropQuery); err != nil {
+			return fmt.Errorf("error al eliminar tabla existente %s: %w", tableName, err)
+		}
+
+		// Crear tabla en PostgreSQL
+		createQuery := m.generateCreateTableQuery(tableName, columns, dataTypes)
+		if _, err := tx.Exec(createQuery); err != nil {
+			return fmt.Errorf("error al crear tabla %s: %w", tableName, err)
+		}
+
+		// Copiar datos
+		if err := m.copyTableData(tableName, columns, tx); err != nil {
+			return fmt.Errorf("error al copiar datos de la tabla %s: %w", tableName, err)
+		}
+	}
+
+	// Confirmar transacción
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("error al confirmar la transacción: %w", err)
+	}
+
+	elapsed := time.Since(startTime)
+	fmt.Printf("\nMigración completada en %v\n", elapsed.Round(time.Second))
+	return nil
+}
+
+func (m *MSSQL) convertDataType(sqlServerType string) string {
+	baseType := strings.ToLower(sqlServerType)
+	length := ""
+	if idx := strings.Index(baseType, "("); idx != -1 {
+		length = baseType[idx:]
+		baseType = baseType[:idx]
+
+		// Validar la longitud
+		if strings.Contains(length, "-1") ||
+			strings.Contains(length, "max") ||
+			strings.Contains(length, "MAX") {
+			switch baseType {
+			case "varchar", "nvarchar":
+				return "varchar" // Sin longitud para MAX
+			case "char", "nchar":
+				return "char" // Sin longitud para MAX
+			case "text", "ntext":
+				return "text"
+			case "varbinary", "binary", "image":
+				return "bytea"
+			default:
+				return m.getBaseType(baseType)
+			}
+		}
+
+		// Para tipos que deberían mantener su longitud
+		if baseType == "varchar" || baseType == "nvarchar" ||
+			baseType == "char" || baseType == "nchar" {
+			if _, err := strconv.Atoi(strings.Trim(length, "()")); err == nil {
+				return m.getBaseType(baseType) + length
+			}
+		}
+	}
+
+	return m.getBaseType(baseType)
+}
+
+func (m *MSSQL) getBaseType(sqlServerType string) string {
+	switch sqlServerType {
+	case "varchar", "nvarchar":
+		return "varchar"
+	case "text", "ntext":
+		return "text"
+	case "char", "nchar":
+		return "char"
+	case "int":
+		return "integer"
+	case "bigint":
+		return "bigint"
+	case "smallint":
+		return "smallint"
+	case "tinyint":
+		return "smallint"
+	case "decimal", "numeric":
+		return "numeric"
+	case "float":
+		return "double precision"
+	case "real":
+		return "real"
+	case "datetime", "datetime2", "smalldatetime":
+		return "timestamp"
+	case "date":
+		return "date"
+	case "time":
+		return "time"
+	case "bit":
+		return "boolean"
+	case "binary", "varbinary", "image":
+		return "bytea"
+	case "uniqueidentifier":
+		return "uuid"
+	case "xml":
+		return "xml"
+	case "money", "smallmoney":
+		return "numeric"
+	default:
+		return "text"
+	}
+}
+
+func (m *MSSQL) generateCreateTableQuery(tableName string, columns []string, dataTypes []string) string {
+	var columnDefs []string
+	for i := range columns {
+		// Escapar nombres de columnas con comillas dobles
+		columnName := strings.ReplaceAll(columns[i], "-", "_")
+		columnDefs = append(columnDefs, fmt.Sprintf(`"%s" %s`, columnName, dataTypes[i]))
+	}
+	query := fmt.Sprintf(`CREATE TABLE "%s" (%s)`, tableName, strings.Join(columnDefs, ", "))
+	fmt.Printf("Query de creación de tabla: %s\n", query)
+	// Escapar nombre de tabla con comillas dobles
+	return query
+}
+
+func (m *MSSQL) copyTableData(tableName string, columns []string, tx *sql.Tx) error {
+	// Obtener el total de filas para calcular el progreso
+	var totalRows int
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)
+	if err := m.DB.QueryRow(countQuery).Scan(&totalRows); err != nil {
+		return fmt.Errorf("error al contar filas: %w", err)
+	}
+
+	// Construir consulta para seleccionar datos
+	selectQuery := fmt.Sprintf("SELECT %s FROM %s", strings.Join(columns, ", "), tableName)
+	rows, err := m.DB.Query(selectQuery)
+	if err != nil {
+		return fmt.Errorf("error al seleccionar datos: %w", err)
+	}
+	defer rows.Close()
+
+	const batchSize = 1000
+	batch := make([][]interface{}, 0, batchSize)
+
+	// Variables para el seguimiento del progreso
+	processedRows := 0
+	lastProgressPrinted := 0
+	startTime := time.Now()
+
+	// Preparar valores para escaneo
+	values := make([]interface{}, len(columns))
+	scanArgs := make([]interface{}, len(columns))
+	for i := range values {
+		scanArgs[i] = &values[i]
+	}
+
+	fmt.Printf("\nIniciando transferencia de tabla %s (%d filas totales)\n", tableName, totalRows)
+
+	// Procesar filas en lotes
+	for rows.Next() {
+		if err := rows.Scan(scanArgs...); err != nil {
+			return fmt.Errorf("error al escanear fila: %w", err)
+		}
+
+		// Convertir y sanitizar valores
+		rowValues := make([]interface{}, len(values))
+		for i, v := range values {
+			switch val := v.(type) {
+			case []byte:
+				// Convertir a string y limpiar caracteres no UTF8 y nulos
+				str := strings.Map(func(r rune) rune {
+					if r == 0x00 || r == utf8.RuneError {
+						return -1
+					}
+					return r
+				}, string(val))
+
+				// Si después de la limpieza la cadena está vacía, usar NULL
+				if str == "" {
+					rowValues[i] = nil
+				} else {
+					rowValues[i] = str
+				}
+			case string:
+				// Verificar si la columna es de tipo UUID
+				if strings.Contains(strings.ToLower(columns[i]), "uniqueidentifier") {
+					// Si es una cadena vacía o nil, usar NULL
+					if val == "" {
+						rowValues[i] = nil
+					} else {
+						// Intentar formatear como UUID válido
+						if len(val) >= 32 {
+							// Formatear como UUID estándar
+							formattedUUID := fmt.Sprintf("%s-%s-%s-%s-%s",
+								val[0:8], val[8:12], val[12:16], val[16:20], val[20:32])
+							rowValues[i] = formattedUUID
+						} else {
+							// Si no tiene el formato esperado, usar NULL
+							rowValues[i] = nil
+						}
+					}
+				} else {
+					rowValues[i] = val
+				}
+			default:
+				rowValues[i] = val
+			}
+		}
+
+		batch = append(batch, rowValues)
+		processedRows++
+
+		// Mostrar progreso cada 5%
+		progress := (processedRows * 100) / totalRows
+		if progress%5 == 0 && progress != lastProgressPrinted {
+			elapsed := time.Since(startTime)
+			rate := float64(processedRows) / elapsed.Seconds()
+			remaining := time.Duration(float64(totalRows-processedRows)/rate) * time.Second
+
+			fmt.Printf("Progreso %s: %d%% (%d/%d filas) - %.0f filas/seg - Tiempo restante: %v\n",
+				tableName, progress, processedRows, totalRows, rate, remaining.Round(time.Second))
+			lastProgressPrinted = progress
+		}
+
+		if len(batch) >= batchSize {
+			if err := m.executeBatchInsert(tx, tableName, columns, batch); err != nil {
+				return err
+			}
+			batch = batch[:0]
+		}
+	}
+
+	// Insertar el último lote
+	if len(batch) > 0 {
+		if err := m.executeBatchInsert(tx, tableName, columns, batch); err != nil {
+			return err
+		}
+	}
+
+	elapsed := time.Since(startTime)
+	fmt.Printf("Completada la transferencia de %s: %d filas en %v\n",
+		tableName, totalRows, elapsed.Round(time.Second))
+
+	return nil
+}
+
+func (m *MSSQL) executeBatchInsert(tx *sql.Tx, tableName string, columns []string, batch [][]interface{}) error {
+	valueStrings := make([]string, 0, len(batch))
+	values := make([]interface{}, 0, len(batch)*len(columns))
+
+	// Escapar nombres de columnas
+	quotedColumns := make([]string, len(columns))
+	for i, col := range columns {
+		safeColumnName := strings.ReplaceAll(col, "-", "_")
+		quotedColumns[i] = fmt.Sprintf(`"%s"`, safeColumnName)
+	}
+
+	for i, row := range batch {
+		placeholders := make([]string, len(columns))
+		for j := range columns {
+			placeholders[j] = fmt.Sprintf("$%d", i*len(columns)+j+1)
+		}
+		valueStrings = append(valueStrings, "("+strings.Join(placeholders, ", ")+")")
+		values = append(values, row...)
+	}
+
+	safeTableName := strings.ReplaceAll(tableName, "-", "_")
+	query := fmt.Sprintf(
+		`INSERT INTO "%s" (%s) VALUES %s`,
+		safeTableName,
+		strings.Join(quotedColumns, ", "),
+		strings.Join(valueStrings, ", "),
+	)
+
+	if _, err := tx.Exec(query, values...); err != nil {
+		return fmt.Errorf("error al insertar lote: %w", err)
+	}
+
+	return nil
+}
+
+// FindInvalidUUIDValues busca valores UUID inválidos comparando ambas bases de datos
+func (m *MSSQL) FindInvalidUUIDValues(tableName string) error {
+	// Consulta para obtener los datos de SQL Server
+	query := fmt.Sprintf(`
+        SELECT *
+        FROM %s 
+        WHERE CAST(nombre_columna_real AS VARCHAR(MAX)) NOT LIKE 
+            '________-____-____-____-____________'`, tableName)
+
+	rows, err := m.DB.Query(query)
+	if err != nil {
+		return fmt.Errorf("error al consultar SQL Server: %w", err)
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return fmt.Errorf("error al obtener columnas: %w", err)
+	}
+
+	fmt.Printf("\nBuscando valores UUID inválidos en la tabla %s\n", tableName)
+
+	count := 0
+	for rows.Next() {
+		values := make([]interface{}, len(cols))
+		valuePtrs := make([]interface{}, len(cols))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return fmt.Errorf("error al escanear fila: %w", err)
+		}
+
+		// Revisar cada columna por valores UUID inválidos
+		for i, col := range cols {
+			if val, ok := values[i].(string); ok {
+				// Verificar si parece ser un UUID pero no tiene el formato correcto
+				if strings.Contains(strings.ToLower(col), "uniqueidentifier") {
+					if val != "" && !isValidUUID(val) {
+						count++
+						fmt.Printf("\nValor UUID inválido encontrado:\n")
+						fmt.Printf("Columna: %s\n", col)
+						fmt.Printf("Valor: %s\n", val)
+
+						// Mostrar toda la fila para contexto
+						fmt.Println("\nDatos completos de la fila:")
+						for j, colName := range cols {
+							fmt.Printf("%s: %v\n", colName, values[j])
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if count == 0 {
+		fmt.Printf("No se encontraron valores UUID inválidos en la tabla %s\n", tableName)
+	} else {
+		fmt.Printf("\nSe encontraron %d valores UUID inválidos en total\n", count)
+	}
+
+	return nil
+}
+
+// isValidUUID verifica si una cadena tiene el formato UUID válido
+func isValidUUID(str string) bool {
+	if len(str) != 36 {
+		return false
+	}
+
+	// Formato esperado: 8-4-4-4-12 caracteres
+	parts := strings.Split(str, "-")
+	if len(parts) != 5 {
+		return false
+	}
+
+	lengths := []int{8, 4, 4, 4, 12}
+	for i, part := range parts {
+		if len(part) != lengths[i] {
+			return false
+		}
+		// Verificar que solo contenga caracteres hexadecimales
+		for _, c := range part {
+			if !strings.ContainsRune("0123456789abcdefABCDEF", c) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func sanitizeString(input string) string {
+	return strings.Map(func(r rune) rune {
+		// Eliminar caracteres nulos y secuencias UTF-8 inválidas
+		if r == 0x00 || r == utf8.RuneError {
+			return -1
+		}
+		return r
+	}, input)
+}
