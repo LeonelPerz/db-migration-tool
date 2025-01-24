@@ -167,7 +167,6 @@ func (m *MSSQL) GetAllTables() error {
 		if err != nil {
 			return fmt.Errorf("error al obtener las tablas del esquema %s: %w", schemaName, err)
 		}
-		// m.Schemes = append(m.Schemes, schema)
 	}
 
 	return nil
